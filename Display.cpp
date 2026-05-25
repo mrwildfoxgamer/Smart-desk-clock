@@ -386,30 +386,73 @@ void drawClockPage(struct tm &t) {
 // ─────────────────────────────────────────────────────────────
 // PAGE 1: SENSOR PAGE
 // ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// PAGE 1: SENSOR PAGE
+// ─────────────────────────────────────────────────────────────
+// ── Helper: Calculate Heat Index (Celsius) ────────────────────
+float calculateHeatIndex(float tempC, float humidity) {
+  // Convert Celsius to Fahrenheit for the standard formula
+  float tF = (tempC * 9.0f / 5.0f) + 32.0f;
+  
+  // Simple formula (works best for lower temperatures)
+  float hiF = 0.5f * (tF + 61.0f + ((tF - 68.0f) * 1.2f) + (humidity * 0.094f));
+
+  // If the simple Heat Index is 80°F or higher, use the full Rothfusz equation
+  if (hiF > 79.0f) {
+    hiF = -42.379f + 2.04901523f * tF + 10.14333127f * humidity 
+          - 0.22475541f * tF * humidity - 0.00683783f * tF * tF 
+          - 0.05481717f * humidity * humidity + 0.00122874f * tF * tF * humidity 
+          + 0.00085282f * tF * humidity * humidity - 0.00000199f * tF * tF * humidity * humidity;
+  }
+  
+  // Convert back to Celsius
+  return (hiF - 32.0f) * 5.0f / 9.0f;
+}
+// ─────────────────────────────────────────────────────────────
 void drawSensorPage() {
-  if (!ahtConnected) {
-    if (fullRedrawNeeded) {
-      tft.fillScreen(C_BLACK);
-      tft.setTextColor(ST77XX_RED); tft.setTextSize(2);
-      tft.setCursor(30, 100); tft.print("Sensor not found");
-      drawDots();
-      fullRedrawNeeded = false;
+  // Static state to remember things between frames
+  static uint32_t lastSensorRead = 0;
+  static sensors_event_t he, te; 
+  static bool isOnline = false;
+  static int lastDrawnOnline = -1; // -1 means it hasn't been drawn yet
+
+  bool dataChanged = false;
+
+  // 1. Poll sensor every 2 seconds, or immediately if we have no baseline
+  if (millis() - lastSensorRead >= 2000 || s_prevTempC == -999.0f) {
+    sensors_event_t temp_he, temp_te;
+    
+    // getEvent() actually returns true if the sensor responds successfully over I2C
+    if (aht.getEvent(&temp_he, &temp_te)) {
+      isOnline = true;
+      
+      // SAFETY CHECK: Only process if data is sane
+      if (temp_te.temperature >= -20.0f && temp_te.temperature <= 80.0f) {
+        he = temp_he;
+        te = temp_te;
+        
+        dataChanged = (fabsf(te.temperature - s_prevTempC) >= 0.1f ||
+                       fabsf(he.relative_humidity - s_prevHumidity) >= 0.5f);
+                       
+        if (dataChanged) {
+          s_prevTempC    = te.temperature;
+          s_prevHumidity = he.relative_humidity;
+        }
+      }
+    } else {
+      // Sensor failed to respond
+      isOnline = false;
     }
-    return;
+    lastSensorRead = millis();
   }
 
-  sensors_event_t he, te;
-  aht.getEvent(&he, &te);
-  if (te.temperature < -20 || te.temperature > 80) return;
+  // If absolutely nothing needs updating (no data change, no dot color change, no swipe), exit early!
+  if (!dataChanged && !fullRedrawNeeded && isOnline == lastDrawnOnline) return;
 
-  bool dataChanged = (fabsf(te.temperature - s_prevTempC) >= 0.1f ||
-                      fabsf(he.relative_humidity - s_prevHumidity) >= 0.5f);
+  // We need this flag because a full page swipe requires us to redraw the text too
+  bool needsTextRedraw = dataChanged;
 
-  if (!dataChanged && !fullRedrawNeeded) return;
-
-  s_prevTempC    = te.temperature;
-  s_prevHumidity = he.relative_humidity;
-
+  // 2. Full Background Redraw (Only triggers when swiping pages)
   if (fullRedrawNeeded) {
     tft.fillScreen(C_BLACK);
     tft.fillRect(0, 0, SW, 28, 0x0842);
@@ -421,27 +464,61 @@ void drawSensorPage() {
     tft.setCursor(20, 122); tft.print("DEW POINT");
     tft.setCursor(SW/2 + 20, 122); tft.print("ABS HUMIDITY");
     drawDots();
+    
     fullRedrawNeeded = false;
+    lastDrawnOnline = -1; // Force the status dot to redraw on this new background
+
+    // If we have cached sensor data, force the text to draw over the new background
+    if (s_prevTempC != -999.0f) {
+      needsTextRedraw = true;
+    }
   }
+
+  // 3. INDEPENDENT STATUS DOT REDRAW
+  if (isOnline != lastDrawnOnline) {
+    uint16_t dotColor = isOnline ? 0x07E0 : 0xF800; // Green for online, Red for offline
+    
+    // Clear the exact spot first (matches the 0x0842 header background color)
+    tft.fillCircle(SW - 16, 14, 6, 0x0842);
+    // Draw the actual status dot
+    tft.fillCircle(SW - 16, 14, 4, dotColor);
+    
+    lastDrawnOnline = isOnline;
+  }
+
+  // 4. Data Text Redraw (Skips if data hasn't changed to prevent flickering)
+  if (!needsTextRedraw) return;
 
   // ── Temperature: value + comfort label ───────────────────────
   tft.fillRect(14, 36, 200, 42, C_BLACK);
   char tBuf[8]; dtostrf(te.temperature, 4, 1, tBuf);
-  // degree-C in two steps: big number, small °C
+  
   tft.setTextSize(5); tft.setTextColor(C_WHITE, C_BLACK);
   tft.setCursor(14, 36); tft.print(tBuf);
-  tft.setTextSize(2); tft.print("\xF7""C");   // ÷ glyph acts as degree in GFX font
+  tft.setTextSize(2); tft.print("\xF7""C");   
 
-  // Comfort label based on temperature
+  // Comfort label logic
   const char* tempLabel;
   uint16_t    tempLabelColor;
-  if      (te.temperature < 16.0f) { tempLabel = "COLD";        tempLabelColor = 0x03FF; } // cyan-ish
-  else if (te.temperature < 22.0f) { tempLabel = "COMFORTABLE"; tempLabelColor = 0x07E0; } // green
-  else if (te.temperature < 28.0f) { tempLabel = "WARM";        tempLabelColor = 0xFD20; } // orange
-  else                              { tempLabel = "HOT";         tempLabelColor = 0xF800; } // red
+  if      (te.temperature < 16.0f) { tempLabel = "COLD";        tempLabelColor = 0x03FF; } 
+  else if (te.temperature < 26.0f) { tempLabel = "COMFORTABLE"; tempLabelColor = 0x07E0; } 
+  else if (te.temperature < 29.0f) { tempLabel = "WARM";        tempLabelColor = 0xFD20; } 
+  else                             { tempLabel = "HOT";         tempLabelColor = 0xF800; } 
+
+  // Heat Index UI
+  float heatIndex = calculateHeatIndex(te.temperature, he.relative_humidity);
+  char hiBuf[8];
+  dtostrf(heatIndex, 4, 1, hiBuf);
+
   tft.fillRect(14, 82, 200, 14, C_BLACK);
-  tft.setTextSize(1); tft.setTextColor(tempLabelColor, C_BLACK);
-  tft.setCursor(14, 82); tft.print("FEELS ");  tft.print(tempLabel);
+  tft.setTextSize(1); 
+  tft.setTextColor(tempLabelColor, C_BLACK);
+  tft.setCursor(14, 82); 
+  tft.print("FEELS "); 
+  tft.print(hiBuf); 
+  tft.print("\xF7""C ("); 
+  tft.print(tempLabel); 
+  tft.print(")");
 
   // ── Humidity: value + comfort label ──────────────────────────
   tft.fillRect(SW/2 + 10, 36, SW/2 - 24, 72, C_BLACK);
@@ -451,10 +528,10 @@ void drawSensorPage() {
 
   const char* humLabel;
   uint16_t    humLabelColor;
-  if      (he.relative_humidity < 30.0f) { humLabel = "DRY";       humLabelColor = 0xFD20; }
-  else if (he.relative_humidity < 60.0f) { humLabel = "IDEAL";     humLabelColor = 0x07E0; }
-  else if (he.relative_humidity < 75.0f) { humLabel = "HUMID";     humLabelColor = 0xFFE0; }
-  else                                    { humLabel = "VERY HUMID";humLabelColor = 0xF800; }
+  if      (he.relative_humidity < 30.0f) { humLabel = "DRY";       humLabelColor = 0xde47; }
+  else if (he.relative_humidity < 60.0f) { humLabel = "IDEAL";     humLabelColor = 0x0795; }
+  else if (he.relative_humidity < 75.0f) { humLabel = "HUMID";     humLabelColor = 0x0334; }
+  else                                   { humLabel = "VERY HUMID";humLabelColor = 0x001f; }
   tft.setTextSize(1); tft.setTextColor(humLabelColor, C_BLACK);
   tft.setCursor(SW/2 + 10, 82); tft.print(humLabel);
 
@@ -463,14 +540,14 @@ void drawSensorPage() {
   float dewPoint= (243.12f * gamma) / (17.62f - gamma);
   char dpBuf[8]; dtostrf(dewPoint, 4, 1, dpBuf);
   tft.fillRect(20, 134, SW/2 - 28, 28, C_BLACK);
-  tft.setTextSize(3); tft.setTextColor(0x5D1B, C_BLACK);
+  tft.setTextSize(3); tft.setTextColor(0x965e, C_BLACK);
   tft.setCursor(20, 134); tft.print(dpBuf); tft.setTextSize(1); tft.print("\xF7""C");
 
   // ── Absolute Humidity ─────────────────────────────────────────
   float absHum = (6.112f * expf((17.67f * te.temperature)/(te.temperature + 243.5f)) * he.relative_humidity * 2.1674f) / (273.15f + te.temperature);
   char ahBuf[10]; dtostrf(absHum, 4, 1, ahBuf); strcat(ahBuf, "g/m3");
   tft.fillRect(SW/2 + 20, 134, SW/2 - 28, 28, C_BLACK);
-  tft.setTextSize(2); tft.setTextColor(0x07FF, C_BLACK);
+  tft.setTextSize(2); tft.setTextColor(0x07fe, C_BLACK);
   tft.setCursor(SW/2 + 20, 134); tft.print(ahBuf);
 }
 
