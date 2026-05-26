@@ -57,6 +57,7 @@ void drawWeatherPage(WeatherData* data);
 
 // ── BMO Overlay Logic ─────────────────────────────────────────
 bool isBmoActive();
+bool bmoTrackChanged(const char* track, const char* artist);
 void activateBmo(BmoMood mood, const char* track, const char* artist);
 void dismissBmo();
 void UpdateBmoAnimation();

@@ -52,8 +52,11 @@ void loop() {
         dismissBmo();
         wasPlaying = false;
       } else if (lfmData.nowPlaying && isBmoActive() && lfmData.needsRedraw) {
-        // Track changed mid-play
-        activateBmo((BmoMood)lfmData.bmoMood, lfmData.track, lfmData.artist);
+        // Only reinitialise BMO if the track genuinely changed
+        if (bmoTrackChanged(lfmData.track, lfmData.artist)) {
+          activateBmo((BmoMood)lfmData.bmoMood, lfmData.track, lfmData.artist);
+        }
+        lfmData.needsRedraw = false;  // consume the flag either way
       }
     }
     xSemaphoreGive(lfmMutex);

@@ -30,24 +30,52 @@ static void safeCopy(char* dst, size_t dstSize, const char* src) {
 }
 
 // ── BMO State ─────────────────────────────────────────────────
-GFXcanvas16* bmoFace = nullptr;
+// bmoFace  – redrawn every frame (face body + animated features)
+// bmoBgCache – pre-rendered static face body, copied into bmoFace each frame
+//              so we never re-draw the body geometry per-frame
+GFXcanvas16* bmoFace    = nullptr;
+GFXcanvas16* bmoBgCache = nullptr;   // pre-baked static face body
+
 static bool      bmoActive          = false;
 static BmoMood   bmoMood            = BMO_NEUTRAL;
 static uint32_t  bmoAnimFrame       = 0;
 static uint32_t  bmoLastDraw        = 0;
-static char      currentBmoTrack[48] = "";
+static char      currentBmoTrack[48]  = "";
 static char      currentBmoArtist[40] = "";
-static bool      bmoNeedsFullRedraw  = true;
+static bool      bmoNeedsFullRedraw   = true;
 
-#define BMO_CV_W 240
-#define BMO_CV_H 100
-#define BMO_CV_X (160 - (BMO_CV_W / 2)) 
-#define BMO_CV_Y (120 - (BMO_CV_H / 2)) 
-#define CV_CX (BMO_CV_W / 2) 
-#define CV_CY (BMO_CV_H / 2) 
-#define BMO_EYE_OFFSET_X 45  
-#define BMO_EYE_Y        35  
+// Returns true (and updates cache) only when track+artist differ from last shown
+bool bmoTrackChanged(const char* track, const char* artist) {
+  if (strcmp(track, currentBmoTrack) != 0 || strcmp(artist, currentBmoArtist) != 0)
+    return true;
+  return false;
+}
+
+// Canvas / geometry constants
+#define BMO_CV_W        240
+#define BMO_CV_H        100
+#define BMO_CV_X        (160 - (BMO_CV_W / 2))
+#define BMO_CV_Y        (120 - (BMO_CV_H / 2))
+#define CV_CX           (BMO_CV_W / 2)
+#define CV_CY           (BMO_CV_H / 2)
+#define BMO_EYE_OFFSET_X 45
+#define BMO_EYE_Y        35
 #define BMO_MOUTH_Y      60
+
+// ── Static face-body geometry (drawn once into bmoBgCache) ────
+// Body outline
+#define BMO_BODY_X      10
+#define BMO_BODY_Y       5
+#define BMO_BODY_W     (BMO_CV_W - 20)
+#define BMO_BODY_H     (BMO_CV_H - 10)
+#define BMO_BODY_R      12
+
+// Screen bezel (the dark rounded rect inside BMO's face)
+#define BMO_SCR_X       30
+#define BMO_SCR_Y       10
+#define BMO_SCR_W      (BMO_CV_W - 60)
+#define BMO_SCR_H      (BMO_CV_H - 22)
+#define BMO_SCR_R        8
 
 // ── Star Coordinates for Clock ────────────────────────────────
 static const uint16_t SX[] = {12,30,52,78,102,122,150,172,198,220,242,268,288,308,18,42,68,94,118,144,168,194,218,246,274,300,25,60,100,140,180,220,262,298};
@@ -166,13 +194,40 @@ void drawSyncingScreen() {
 // ─────────────────────────────────────────────────────────────
 bool isBmoActive() { return bmoActive; }
 
+// ── Pre-bake the static face body into bmoBgCache ─────────────
+static void bmoBuildBodyCache() {
+  if (!bmoBgCache) return;
+  bmoBgCache->fillScreen(C_BMO_FACE);
+
+  // Outer body rounded rect
+  bmoBgCache->fillRoundRect(BMO_BODY_X, BMO_BODY_Y, BMO_BODY_W, BMO_BODY_H, BMO_BODY_R, C_BMO_MGREEN);
+  bmoBgCache->fillRoundRect(BMO_BODY_X + 2, BMO_BODY_Y + 2, BMO_BODY_W - 4, BMO_BODY_H - 4, BMO_BODY_R - 1, C_BMO_FACE);
+
+  // Screen bezel (dark surround)
+  bmoBgCache->fillRoundRect(BMO_SCR_X - 3, BMO_SCR_Y - 3, BMO_SCR_W + 6, BMO_SCR_H + 6, BMO_SCR_R + 2, C_BMO_OUTLINE);
+  // Screen interior (face colour — eyes/mouth drawn on top each frame)
+  bmoBgCache->fillRoundRect(BMO_SCR_X, BMO_SCR_Y, BMO_SCR_W, BMO_SCR_H, BMO_SCR_R, C_BMO_FACE);
+
+  // Blush dots
+  bmoBgCache->fillCircle(CV_CX - BMO_EYE_OFFSET_X - 12, BMO_EYE_Y + 10, 4, C_BMO_BLUSH);
+  bmoBgCache->fillCircle(CV_CX + BMO_EYE_OFFSET_X + 12, BMO_EYE_Y + 10, 4, C_BMO_BLUSH);
+
+  // Teeth hint (small white line below mouth area — drawn once)
+  bmoBgCache->fillRoundRect(CV_CX - 8, BMO_MOUTH_Y + 8, 16, 4, 2, C_BMO_TOOTH);
+}
+
 void activateBmo(BmoMood mood, const char* track, const char* artist) {
   if (!bmoActive) {
-    bmoFace = new GFXcanvas16(BMO_CV_W, BMO_CV_H);
+    bmoFace    = new GFXcanvas16(BMO_CV_W, BMO_CV_H);
+    bmoBgCache = new GFXcanvas16(BMO_CV_W, BMO_CV_H);
+    bmoBuildBodyCache();
     bmoActive = true;
+  } else if (mood != bmoMood) {
+    // Mood changed: rebuild body cache (blush/teeth colours unchanged but be safe)
+    bmoBuildBodyCache();
   }
   bmoMood = mood;
-  safeCopy(currentBmoTrack, sizeof(currentBmoTrack), track);
+  safeCopy(currentBmoTrack,  sizeof(currentBmoTrack),  track);
   safeCopy(currentBmoArtist, sizeof(currentBmoArtist), artist);
   bmoNeedsFullRedraw = true;
   bmoAnimFrame       = 0;
@@ -181,8 +236,8 @@ void activateBmo(BmoMood mood, const char* track, const char* artist) {
 void dismissBmo() {
   if (bmoActive) {
     bmoActive = false;
-    delete bmoFace;
-    bmoFace = nullptr;
+    delete bmoFace;    bmoFace    = nullptr;
+    delete bmoBgCache; bmoBgCache = nullptr;
     resetPageState();
   }
 }
@@ -205,67 +260,178 @@ void bmoDrawClosedEyes(int offsetX, int offsetY) {
 }
 
 void UpdateBmoAnimation() {
-  if (!bmoActive || bmoFace == nullptr) return;
+  if (!bmoActive || !bmoFace || !bmoBgCache) return;
   uint32_t now = millis();
   if (now - bmoLastDraw < BMO_FRAME_MS) return;
   bmoLastDraw = now;
 
+  // ── One-shot: paint the static full-screen background ─────────
+  // Track/artist text and the teal fill never change; only draw them
+  // when activateBmo() triggers bmoNeedsFullRedraw.
   if (bmoNeedsFullRedraw) {
     bmoNeedsFullRedraw = false;
-    tft.fillScreen(C_BMO_FACE);
+
+    // Paint only the regions OUTSIDE the canvas — never the full screen.
+    // Canvas occupies x:BMO_CV_X..BMO_CV_X+BMO_CV_W, y:BMO_CV_Y..BMO_CV_Y+BMO_CV_H
+    // Top strip
+    tft.fillRect(0, 0, SW, BMO_CV_Y, C_BMO_FACE);
+    // Bottom strip
+    tft.fillRect(0, BMO_CV_Y + BMO_CV_H, SW, SH - (BMO_CV_Y + BMO_CV_H), C_BMO_FACE);
+    // Left strip (canvas height only)
+    tft.fillRect(0, BMO_CV_Y, BMO_CV_X, BMO_CV_H, C_BMO_FACE);
+    // Right strip (canvas height only)
+    tft.fillRect(BMO_CV_X + BMO_CV_W, BMO_CV_Y, SW - (BMO_CV_X + BMO_CV_W), BMO_CV_H, C_BMO_FACE);
+
+    // Track name (bottom area, below the canvas)
     tft.setTextSize(1);
-    tft.setTextColor(0x42A8, C_BMO_FACE);
+    tft.setTextColor(C_BMO_OUTLINE, C_BMO_FACE);
     char trackLine[48]; truncate(trackLine, currentBmoTrack, 40);
     int16_t x1, y1; uint16_t tw, th;
     tft.getTextBounds(trackLine, 0, 0, &x1, &y1, &tw, &th);
-    tft.setCursor((SW - (int)tw) / 2, SH - 22);
+    // Clear + draw track
+    tft.fillRect(0, SH - 26, SW, 12, C_BMO_FACE);
+    tft.setCursor((SW - (int)tw) / 2, SH - 24);
     tft.print(trackLine);
+
+    // Artist name
     char artLine[40]; truncate(artLine, currentBmoArtist, 36);
     tft.getTextBounds(artLine, 0, 0, &x1, &y1, &tw, &th);
-    tft.setCursor((SW - (int)tw) / 2, SH - 12);
+    tft.fillRect(0, SH - 14, SW, 12, C_BMO_FACE);
+    tft.setCursor((SW - (int)tw) / 2, SH - 13);
     tft.print(artLine);
+
+    // Decorative border dots
+    for (int i = 0; i < 5; i++) {
+      tft.fillCircle(20 + i * 14, BMO_CV_Y - 10, 3, C_BMO_MGREEN);
+      tft.fillCircle(20 + i * 14, BMO_CV_Y + BMO_CV_H + 10, 3, C_BMO_MGREEN);
+    }
   }
 
-  bmoFace->fillScreen(C_BMO_FACE);
+  // ── Per-frame: copy pre-baked body into face canvas ────────────
+  // memcpy is fast: BMO_CV_W*BMO_CV_H*2 = 48 000 bytes (~one SPI burst)
+  memcpy(bmoFace->getBuffer(),
+         bmoBgCache->getBuffer(),
+         (size_t)BMO_CV_W * BMO_CV_H * sizeof(uint16_t));
+
+  // ── Compute animation parameters for this frame ────────────────
   bmoAnimFrame++;
-  float timeF = (float)bmoAnimFrame;
-  int bobOffset = 0, lookX = 0;
-  bool isBlinking = false, isSinging = false;
+  float tf = (float)bmoAnimFrame;
+  int   bobOffset = 0, lookX = 0;
+  bool  isBlinking = false, isSinging = false;
+  bool  isSquinting = false;   // chill half-closed eyes
+  bool  isWide = false;        // surprised wide eyes
 
   switch (bmoMood) {
     case BMO_NEUTRAL:
-      bobOffset = (int)(sinf(timeF * 0.15f) * 2.0f);
-      lookX     = (int)(sinf(timeF * 0.05f) * 4.0f);
-      isBlinking= (bmoAnimFrame % 60 < 4);
+      bobOffset  = (int)(sinf(tf * 0.12f) * 2.0f);
+      lookX      = (int)(sinf(tf * 0.05f) * 4.0f);
+      isBlinking = (bmoAnimFrame % 65 < 3);
       break;
+
     case BMO_HAPPY:
-      bobOffset = (int)(sinf(timeF * 0.40f) * 4.0f); 
-      lookX     = (int)(sinf(timeF * 0.10f) * 6.0f); 
-      isBlinking= (bmoAnimFrame % 50 < 4);
-      isSinging = (bmoAnimFrame % 10 < 5);
+      bobOffset  = (int)(sinf(tf * 0.40f) * 5.0f);
+      lookX      = (int)(sinf(tf * 0.12f) * 6.0f);
+      isBlinking = (bmoAnimFrame % 48 < 3);
+      isSinging  = (bmoAnimFrame % 12 < 6);
       break;
+
+    case BMO_SURPRISED:
+      // Fast nervous jitter
+      bobOffset  = (bmoAnimFrame % 6 < 3) ? 2 : -2;
+      lookX      = (int)(sinf(tf * 0.5f) * 3.0f);
+      isWide     = true;
+      isBlinking = (bmoAnimFrame % 80 < 2);   // rare blink
+      isSinging  = (bmoAnimFrame % 16 < 4);   // stuttery open mouth
+      break;
+
     case BMO_CHILL:
-      bobOffset = (int)(sinf(timeF * 0.05f) * 3.0f);
-      lookX     = (int)(sinf(timeF * 0.03f) * 2.0f);
+      bobOffset   = (int)(sinf(tf * 0.04f) * 3.0f);
+      lookX       = (int)(sinf(tf * 0.025f) * 2.0f);
+      isSquinting = true;   // always half-closed
       break;
+
+    case BMO_SAD:
+      // Slow heavy bob, downward look drift
+      bobOffset  = (int)(sinf(tf * 0.07f) * 2.5f) + 2;
+      lookX      = (int)(sinf(tf * 0.04f) * 2.0f);
+      isBlinking = (bmoAnimFrame % 90 < 3);
+      break;
+
+    case BMO_DARK:
+      // Slow pulse, slight sway, rare blink
+      bobOffset  = (int)(sinf(tf * 0.06f) * 1.5f);
+      lookX      = (int)(sinf(tf * 0.03f) * 3.0f);
+      isBlinking = (bmoAnimFrame % 120 < 2);
+      break;
+
     default:
-      bobOffset = (int)(sinf(timeF * 0.15f) * 2.0f);
+      bobOffset  = (int)(sinf(tf * 0.12f) * 2.0f);
+      break;
   }
 
-  if (isBlinking && bmoMood != BMO_CHILL) {
+  // ── Draw eyes ─────────────────────────────────────────────────
+  if (isSquinting) {
+    // Chill: half-closed — draw a filled rect over the top half of each eye circle
+    bmoFace->fillCircle(CV_CX - BMO_EYE_OFFSET_X + lookX, BMO_EYE_Y + bobOffset, 6, C_BMO_INK);
+    bmoFace->fillCircle(CV_CX + BMO_EYE_OFFSET_X + lookX, BMO_EYE_Y + bobOffset, 6, C_BMO_INK);
+    // Cover upper half to create squint
+    bmoFace->fillRect(CV_CX - BMO_EYE_OFFSET_X + lookX - 7,
+                      BMO_EYE_Y + bobOffset - 8, 14, 8, C_BMO_FACE);
+    bmoFace->fillRect(CV_CX + BMO_EYE_OFFSET_X + lookX - 7,
+                      BMO_EYE_Y + bobOffset - 8, 14, 8, C_BMO_FACE);
+  } else if (isBlinking) {
     bmoDrawClosedEyes(lookX, bobOffset);
+  } else if (isWide) {
+    // Surprised: larger pupils
+    bmoFace->fillCircle(CV_CX - BMO_EYE_OFFSET_X + lookX, BMO_EYE_Y + bobOffset, 8, C_BMO_INK);
+    bmoFace->fillCircle(CV_CX + BMO_EYE_OFFSET_X + lookX, BMO_EYE_Y + bobOffset, 8, C_BMO_INK);
+    // Highlight spec
+    bmoFace->fillCircle(CV_CX - BMO_EYE_OFFSET_X + lookX + 3, BMO_EYE_Y + bobOffset - 3, 2, C_BMO_FACE);
+    bmoFace->fillCircle(CV_CX + BMO_EYE_OFFSET_X + lookX + 3, BMO_EYE_Y + bobOffset - 3, 2, C_BMO_FACE);
   } else {
     bmoDrawEyes(lookX, bobOffset);
+    // Eye highlight
+    bmoFace->fillCircle(CV_CX - BMO_EYE_OFFSET_X + lookX + 2, BMO_EYE_Y + bobOffset - 2, 1, C_BMO_MLITE);
+    bmoFace->fillCircle(CV_CX + BMO_EYE_OFFSET_X + lookX + 2, BMO_EYE_Y + bobOffset - 2, 1, C_BMO_MLITE);
   }
 
+  // ── Draw mouth ────────────────────────────────────────────────
   if (isSinging) {
-    bmoFace->fillRoundRect(CV_CX - 6 + lookX, BMO_MOUTH_Y + bobOffset - 2, 12, 6, 3, C_BMO_INK);
+    // Open round mouth
+    bmoFace->fillRoundRect(CV_CX - 6 + lookX, BMO_MOUTH_Y + bobOffset - 2, 12, 7, 3, C_BMO_INK);
   } else {
-    if (bmoMood == BMO_HAPPY) drawCanvasCurve(CV_CX + lookX, BMO_MOUTH_Y + bobOffset, 12, 6, true, C_BMO_INK);
-    else if (bmoMood == BMO_SAD) drawCanvasCurve(CV_CX + lookX, BMO_MOUTH_Y + bobOffset + 6, 12, -6, false, C_BMO_INK);
-    else bmoFace->drawLine(CV_CX - 6 + lookX, BMO_MOUTH_Y + bobOffset, CV_CX + 6 + lookX, BMO_MOUTH_Y + bobOffset, C_BMO_INK);
+    switch (bmoMood) {
+      case BMO_HAPPY:
+        drawCanvasCurve(CV_CX + lookX, BMO_MOUTH_Y + bobOffset, 12, 7, true, C_BMO_INK);
+        break;
+      case BMO_SAD:
+        // Frown: upside-down smile, shifted down
+        drawCanvasCurve(CV_CX + lookX, BMO_MOUTH_Y + bobOffset + 6, 10, 6, false, C_BMO_INK);
+        break;
+      case BMO_DARK:
+        // Thin flat line
+        bmoFace->drawLine(CV_CX - 8 + lookX, BMO_MOUTH_Y + bobOffset + 2,
+                          CV_CX + 8 + lookX, BMO_MOUTH_Y + bobOffset + 2, C_BMO_INK);
+        break;
+      case BMO_SURPRISED:
+        // Small 'O'
+        bmoFace->drawCircle(CV_CX + lookX, BMO_MOUTH_Y + bobOffset + 2, 5, C_BMO_INK);
+        break;
+      case BMO_CHILL:
+        // Gentle slight smile
+        drawCanvasCurve(CV_CX + lookX, BMO_MOUTH_Y + bobOffset, 10, 3, true, C_BMO_INK);
+        break;
+      default:
+        // Neutral straight line
+        bmoFace->drawLine(CV_CX - 6 + lookX, BMO_MOUTH_Y + bobOffset,
+                          CV_CX + 6 + lookX, BMO_MOUTH_Y + bobOffset, C_BMO_INK);
+        break;
+    }
   }
 
+  // ── Blit only the face canvas region to screen ─────────────────
+  // This is the ONLY tft write per frame: 240×100 px = 48 KB over SPI.
+  // The surrounding teal area and text are never touched after the first draw.
   tft.drawRGBBitmap(BMO_CV_X, BMO_CV_Y, bmoFace->getBuffer(), BMO_CV_W, BMO_CV_H);
 }
 
